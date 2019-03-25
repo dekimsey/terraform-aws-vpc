@@ -69,6 +69,12 @@ resource "aws_internet_gateway" "this" {
   tags = "${merge(map("Name", format("%s", var.name)), var.tags, var.igw_tags)}"
 }
 
+resource "aws_egress_only_internet_gateway" "this" {
+  count = "${var.enable_ipv6 ? 1 : 0}"
+
+  vpc_id = "${aws_vpc.this.id}"
+}
+
 ################
 # Publiс routes
 ################
@@ -90,6 +96,14 @@ resource "aws_route" "public_internet_gateway" {
   timeouts {
     create = "5m"
   }
+}
+
+resource "aws_route" "public_internet_gateway_ipv6" {
+  count = "${var.enable_ipv6 && length(var.public_subnets) > 0 ? 1 : 0}"
+
+  route_table_id              = "${aws_route_table.public.id}"
+  destination_ipv6_cidr_block = "::/0"
+  gateway_id                  = "${aws_internet_gateway.this.id}"
 }
 
 #################
@@ -144,6 +158,14 @@ resource "aws_route" "database_nat_gateway" {
   }
 }
 
+resource "aws_route" "database_ipv6_egress" {
+  count = "${var.enable_ipv6 ? length(var.azs) : 0}"
+
+  route_table_id              = "${element(aws_route_table.private.*.id, count.index)}"
+  destination_ipv6_cidr_block = "::/0"
+  egress_only_gateway_id      = "${element(aws_egress_only_internet_gateway.this.*.id, 0)}"
+}
+
 #################
 # Redshift routes
 #################
@@ -183,10 +205,14 @@ resource "aws_route_table" "intra" {
 resource "aws_subnet" "public" {
   count = "${var.create_vpc && length(var.public_subnets) > 0 && (!var.one_nat_gateway_per_az || length(var.public_subnets) >= length(var.azs)) ? length(var.public_subnets) : 0}"
 
-  vpc_id                  = "${local.vpc_id}"
-  cidr_block              = "${element(concat(var.public_subnets, list("")), count.index)}"
-  availability_zone       = "${element(var.azs, count.index)}"
-  map_public_ip_on_launch = "${var.map_public_ip_on_launch}"
+  vpc_id                          = "${local.vpc_id}"
+  cidr_block                      = "${element(concat(var.public_subnets, list("")), count.index)}"
+  availability_zone               = "${element(var.azs, count.index)}"
+  map_public_ip_on_launch         = "${var.map_public_ip_on_launch}"
+  assign_ipv6_address_on_creation = "${var.assign_ipv6_address_on_creation}"
+
+  # TODO: Does not unset, need null support or the like see: Terraform 0.12
+  ipv6_cidr_block = "${var.enable_ipv6 && length(var.public_subnet_ipv6_prefixes) > 0 ? cidrsubnet(aws_vpc.this.ipv6_cidr_block, 8, element(concat(var.public_subnet_ipv6_prefixes, list("0")), count.index)) : ""}"
 
   tags = "${merge(map("Name", format("%s-${var.public_subnet_suffix}-%s", var.name, element(var.azs, count.index))), var.tags, var.public_subnet_tags)}"
 }
@@ -197,9 +223,13 @@ resource "aws_subnet" "public" {
 resource "aws_subnet" "private" {
   count = "${var.create_vpc && length(var.private_subnets) > 0 ? length(var.private_subnets) : 0}"
 
-  vpc_id            = "${local.vpc_id}"
-  cidr_block        = "${var.private_subnets[count.index]}"
-  availability_zone = "${element(var.azs, count.index)}"
+  vpc_id                          = "${local.vpc_id}"
+  cidr_block                      = "${var.private_subnets[count.index]}"
+  availability_zone               = "${element(var.azs, count.index)}"
+  assign_ipv6_address_on_creation = "${var.assign_ipv6_address_on_creation}"
+
+  # TODO: Does not unset, need null support or the like see: Terraform 0.12
+  ipv6_cidr_block = "${var.enable_ipv6 && length(var.private_subnet_ipv6_prefixes) > 0  ? cidrsubnet(aws_vpc.this.ipv6_cidr_block, 8, element(coalescelist(var.private_subnet_ipv6_prefixes, list("0")), count.index)) : ""}"
 
   tags = "${merge(map("Name", format("%s-${var.private_subnet_suffix}-%s", var.name, element(var.azs, count.index))), var.tags, var.private_subnet_tags)}"
 }
@@ -210,9 +240,13 @@ resource "aws_subnet" "private" {
 resource "aws_subnet" "database" {
   count = "${var.create_vpc && length(var.database_subnets) > 0 ? length(var.database_subnets) : 0}"
 
-  vpc_id            = "${local.vpc_id}"
-  cidr_block        = "${var.database_subnets[count.index]}"
-  availability_zone = "${element(var.azs, count.index)}"
+  vpc_id                          = "${local.vpc_id}"
+  cidr_block                      = "${var.database_subnets[count.index]}"
+  availability_zone               = "${element(var.azs, count.index)}"
+  assign_ipv6_address_on_creation = "${var.assign_ipv6_address_on_creation}"
+
+  # TODO: Does not unset, need null support or the like see: Terraform 0.12
+  ipv6_cidr_block = "${var.enable_ipv6 && length(var.database_subnet_ipv6_prefixes) > 0 ? cidrsubnet(aws_vpc.this.ipv6_cidr_block, 8, element(concat(var.database_subnet_ipv6_prefixes, list("0")), count.index)) : ""}"
 
   tags = "${merge(map("Name", format("%s-${var.database_subnet_suffix}-%s", var.name, element(var.azs, count.index))), var.tags, var.database_subnet_tags)}"
 }
@@ -280,6 +314,9 @@ resource "aws_subnet" "intra" {
   vpc_id            = "${local.vpc_id}"
   cidr_block        = "${var.intra_subnets[count.index]}"
   availability_zone = "${element(var.azs, count.index)}"
+
+  # TODO: Does not unset, need null support or the like see: Terraform 0.12
+  ipv6_cidr_block = "${var.enable_ipv6 && length(var.intra_subnet_ipv6_prefixes) > 0 ? cidrsubnet(aws_vpc.this.ipv6_cidr_block, 8, element(concat(var.intra_subnet_ipv6_prefixes, list("0")), count.index)) : ""}"
 
   tags = "${merge(map("Name", format("%s-${var.intra_subnet_suffix}-%s", var.name, element(var.azs, count.index))), var.tags, var.intra_subnet_tags)}"
 }
@@ -586,6 +623,14 @@ resource "aws_route" "private_nat_gateway" {
   timeouts {
     create = "5m"
   }
+}
+
+resource "aws_route" "private_ipv6_egress" {
+  count = "${var.enable_ipv6 ? length(var.azs) : 0}"
+
+  route_table_id              = "${element(aws_route_table.private.*.id, count.index)}"
+  destination_ipv6_cidr_block = "::/0"
+  egress_only_gateway_id      = "${aws_egress_only_internet_gateway.this.id}"
 }
 
 ######################
